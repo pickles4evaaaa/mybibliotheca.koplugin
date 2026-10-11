@@ -17,7 +17,20 @@ end
 local network = { connected = true, manual_calls = 0 }
 function network:isConnected() return self.connected end
 function network:runWhenOnline(cb) self.manual_calls = self.manual_calls + 1; cb() end
-local manager = { messages = {} }
+local manager = { messages = {}, tasks = {} }
+function manager:scheduleIn(delay, task) self.tasks[task] = delay end
+function manager:unschedule(task) self.tasks[task] = nil end
+function manager:runQueued()
+    local tasks = self.tasks
+    self.tasks = {}
+    for task in pairs(tasks) do task() end
+end
+function network:willRerunWhenOnline(callback)
+    self.ensure_calls = (self.ensure_calls or 0) + 1
+    if self.connected then return false end
+    self.deferred = callback
+    return true
+end
 function manager:show(widget) self.messages[#self.messages + 1] = widget end
 function manager:close() end
 local timeouts = { resets = 0 }
@@ -75,7 +88,9 @@ for name, module in pairs(stubs) do package.preload[name] = function() return mo
 local Plugin = dofile('main.lua')
 local function fresh(count)
     transport.requests, transport.fail_at, transport.throws = {}, nil, false
-    manager.messages, network.connected, network.manual_calls = {}, true, 0
+    manager.messages, manager.tasks, network.connected, network.manual_calls = {}, {}, true, 0
+    network.ensure_calls, network.deferred = 0, nil
+    network.pending_connection, network.pending_connectivity_check = nil, nil
     local annotations = {}
     for i = 1, count do
         annotations[i] = { drawer = 'lighten', text = ' highlight ' .. i .. ' ', note = '', pageno = i, datetime = '1000' }
@@ -93,7 +108,7 @@ local function fresh(count)
     return p
 end
 local p = fresh(23)
-p:onCloseDocument()
+p:autoPush()
 assert(#transport.requests == 3)
 assert(#transport.requests[1].entries == 10 and #transport.requests[3].entries == 3)
 assert(transport.requests[1].entries[1].id == hash('1\n1000\nhighlight 1'))
@@ -102,15 +117,16 @@ assert(transport.requests[1].timeout[2] == 5)
 assert(network.manual_calls == 0 and #manager.messages == 0)
 assert(p.ui.doc_settings:readSetting('mybibliotheca_pending') == false)
 local old_digest = p.ui.doc_settings:readSetting('mybibliotheca_synced')
-p:onCloseDocument()
+p:autoPush()
 assert(#transport.requests == 3, 'unchanged close must skip upload')
 p.ui.annotation.annotations[1].note = 'new note'
 p:onAnnotationsModified()
 p:onNetworkConnected()
+manager:runQueued()
 assert(#transport.requests == 6, 'edits must upload even just after a successful sync')
 assert(p.ui.doc_settings:readSetting('mybibliotheca_synced') ~= old_digest)
 p:onAnnotationsModified() -- e.g. a style change with unchanged upload content
-p:onCloseDocument()
+p:autoPush()
 assert(#transport.requests == 6, 'unchanged content must skip HTTP')
 
 p = fresh(1)
@@ -132,8 +148,9 @@ assert(#transport.requests == 2)
 assert(p.ui.doc_settings:readSetting('mybibliotheca_pending'))
 assert(p.ui.doc_settings:readSetting('mybibliotheca_synced') == nil)
 p:onNetworkConnected()
+manager:runQueued()
 assert(#transport.requests == 2, 'failed auto pushes must respect cooldown')
-p.last_auto_attempt = os.time() - 301
+p.last_auto_attempt = os.time() - 31
 transport.fail_at = nil
 p:onCloseDocument()
 assert(#transport.requests == 4 and not p.ui.doc_settings:readSetting('mybibliotheca_pending'))
@@ -258,7 +275,7 @@ local function assert_book_preserved()
 end
 network.connected = false
 p:onAnnotationsModified()
-p:onCloseDocument()
+p:autoPush()
 assert_book_preserved()
 network.connected = true
 transport.fail_at = 2
@@ -287,4 +304,131 @@ local restarted = fresh(1)
 restarted:init()
 assert(equal(restarted.config, expected_config), 'restart must retain saved auto-push and connection settings')
 assert(equal(global_settings.values.unrelated, original_settings.unrelated))
+-- Normal reading must send new highlights without requiring a book close.
+local function scheduled_delay()
+    local delay, count = nil, 0
+    for _, value in pairs(manager.tasks) do delay = value; count = count + 1 end
+    return delay, count
+end
+p = fresh(1)
+p:onAnnotationsModified()
+assert(scheduled_delay() == 10 and #transport.requests == 0)
+p.ui.annotation.annotations[1].note = 'edited while reading'
+p:onAnnotationsModified()
+local delay, count = scheduled_delay()
+assert(delay == 10 and count == 1, 'edits must debounce into one upload')
+p:onPageUpdate(2)
+delay, count = scheduled_delay()
+assert(delay == 10 and count == 1, 'page turns must postpone the same idle upload')
+manager:runQueued()
+assert(#transport.requests == 1 and network.ensure_calls == 0)
+assert(transport.requests[1].entries[1].note == 'edited while reading')
+p:onPageUpdate(3)
+assert(next(manager.tasks) == nil, 'clean books must not schedule page-turn uploads')
+
+-- Sleep uploads immediately, cancels the idle timer, and uses progress-sync networking.
+p = fresh(1)
+p:onAnnotationsModified()
+p:onSuspend()
+assert(#transport.requests == 1 and network.ensure_calls == 1)
+assert(next(manager.tasks) == nil)
+p:onResume()
+assert(scheduled_delay() == 1)
+manager:runQueued()
+assert(#transport.requests == 1, 'wake must not resend a clean book')
+
+-- Wake attempts networking; the asynchronous callback sends once connected.
+p = fresh(1)
+network.connected = false
+p:onAnnotationsModified()
+manager:runQueued()
+assert(#transport.requests == 0 and network.ensure_calls == 0)
+p:onSuspend()
+assert(network.ensure_calls == 1 and network.deferred ~= nil)
+assert(#transport.requests == 0 and p.ui.doc_settings:readSetting('mybibliotheca_pending'))
+network.connected = true
+network.deferred()
+assert(#transport.requests == 1)
+
+-- Connection events defer work; disconnect events flush pending highlights immediately.
+p = fresh(1)
+p:onAnnotationsModified()
+p:onNetworkConnected()
+assert(scheduled_delay() == 0.5 and #transport.requests == 0)
+manager:runQueued()
+assert(#transport.requests == 1)
+p.ui.annotation.annotations[1].note = 'before disconnect'
+p:onAnnotationsModified()
+p:onNetworkDisconnecting()
+assert(#transport.requests == 2 and next(manager.tasks) == nil)
+
+-- Failed idle uploads get another opportunity on page turns after the cooldown.
+p = fresh(1)
+transport.fail_at = 1
+p:onAnnotationsModified()
+manager:runQueued()
+assert(p.ui.doc_settings:readSetting('mybibliotheca_pending'))
+p:onPageUpdate(2)
+assert(scheduled_delay() >= 29)
+p.last_auto_attempt = os.time() - 31
+transport.fail_at = nil
+manager:runQueued()
+assert(#transport.requests == 2 and not p.ui.doc_settings:readSetting('mybibliotheca_pending'))
+
+-- Disabling, closing, or replacing a document must prevent stale scheduled uploads.
+p = fresh(1)
+p:onAnnotationsModified()
+local stale_task = p.auto_push_task
+local toggle_menu = {}
+p:addToMainMenu(toggle_menu)
+toggle_menu.mybibliotheca.sub_item_table[2].callback()
+assert(next(manager.tasks) == nil)
+stale_task()
+assert(#transport.requests == 0)
+p = fresh(1)
+p:onAnnotationsModified()
+stale_task = p.auto_push_task
+p:onCloseDocument()
+assert(#transport.requests == 1 and next(manager.tasks) == nil)
+stale_task()
+p:onResume()
+assert(#transport.requests == 1 and next(manager.tasks) == nil)
+p = fresh(1)
+p:onAnnotationsModified()
+p.ui.document = { file = '/different.epub' }
+manager:runQueued()
+assert(#transport.requests == 0)
+p = fresh(1)
+network.connected = false
+p:onSuspend()
+local deferred_auto = network.deferred
+p:onCloseWidget()
+network.connected = true
+deferred_auto()
+assert(#transport.requests == 0, 'a delayed connection must not sync a closed reader')
+
+-- Reader-ready initiates a deferred lifecycle check with existing saved settings.
+p = fresh(1)
+global_settings.values.mybibliotheca = copy(expected_config)
+p:init()
+p.ui.ready()
+assert(scheduled_delay() == 1 and #transport.requests == 0)
+manager:runQueued()
+assert(#transport.requests == 1 and network.ensure_calls == 1)
+
+-- Empty books never wake the radio; reuse Wi-Fi that progress sync is starting.
+p = fresh(0)
+network.connected = false
+p:onResume()
+manager:runQueued()
+assert(network.ensure_calls == 0 and #transport.requests == 0)
+p = fresh(1)
+network.connected = false
+network.pending_connection = true
+p:onSuspend()
+assert(network.ensure_calls == 0 and #transport.requests == 0)
+network.pending_connection = nil
+network.connected = true
+p:onNetworkConnected()
+assert(#transport.requests == 1 and next(manager.tasks) == nil)
 print('All highlight sync tests passed')
