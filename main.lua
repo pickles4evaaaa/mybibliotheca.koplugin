@@ -1,11 +1,12 @@
 local DataStorage = require("datastorage")
-local MyClipping = require("clip")
+local CheckButton = require("ui/widget/checkbutton")
 local InfoMessage = require("ui/widget/infomessage")
 local LuaSettings = require("luasettings")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local logger = require("logger")
 local http = require("socket.http")
 local ltn12 = require("ltn12")
 local md5 = require("ffi/sha2").md5
@@ -17,14 +18,17 @@ local _ = require("gettext")
 
 local MyBibliotheca = WidgetContainer:extend{
     name = "mybibliotheca",
+    version = "2.0.0",
     is_doc_only = false,
 }
 
 function MyBibliotheca:init()
     self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/mybibliotheca.lua")
     self.config = self.settings:readSetting("mybibliotheca") or {}
-    self.parser = MyClipping:new{ ui = self.ui, settings = {} }
     self.ui.menu:registerToMainMenu(self)
+    if self.ui.document then
+        self.ui:registerPostReaderReadyCallback(function() self:autoPush() end)
+    end
 end
 
 function MyBibliotheca:addToMainMenu(menu_items)
@@ -37,6 +41,15 @@ function MyBibliotheca:addToMainMenu(menu_items)
                 callback = function() self:configure() end,
             },
             {
+                text = _("Auto-push highlights (existing Wi-Fi only)"),
+                checked_func = function() return self.config.auto_push == true end,
+                callback = function()
+                    self.config.auto_push = not self.config.auto_push
+                    self:saveSettings()
+                    if self.config.auto_push then self:markPending() end
+                end,
+            },
+            {
                 text = _("Send this book's highlights"),
                 enabled_func = function() return self.ui.document ~= nil end,
                 callback = function() self:syncCurrentBook() end,
@@ -47,6 +60,7 @@ end
 
 function MyBibliotheca:configure()
     local dialog
+    local auto_push
     dialog = MultiInputDialog:new{
         title = _("MyBibliotheca highlights settings"),
         fields = {
@@ -81,7 +95,9 @@ function MyBibliotheca:configure()
                         if password ~= "" then
                             self.config.userkey = md5(password)
                         end
+                        self.config.auto_push = auto_push.checked == true
                         self:saveSettings()
+                        if self.config.auto_push then self:markPending() end
                         UIManager:close(dialog)
                         UIManager:show(InfoMessage:new{
                             text = _("Settings saved. The password is not stored; its KOReader sync key is saved on this device."),
@@ -91,104 +107,179 @@ function MyBibliotheca:configure()
             },
         },
     }
+    auto_push = CheckButton:new{
+        text = _("Auto-push on book close (existing Wi-Fi only)"),
+        checked = self.config.auto_push == true,
+        parent = dialog,
+    }
+    dialog:addWidget(auto_push)
     UIManager:show(dialog)
     dialog:onShowKeyboard()
 end
 
-function MyBibliotheca:syncCurrentBook()
+-- Pending state belongs to the book sidecar, so no annotation queue is kept in RAM.
+function MyBibliotheca:markPending()
+    if self.ui.document and self.ui.doc_settings then
+        self.ui.doc_settings:saveSetting("mybibliotheca_pending", true)
+    end
+end
+
+function MyBibliotheca:onAnnotationsModified()
+    self:markPending()
+end
+
+function MyBibliotheca:onNetworkConnected()
+    self:autoPush()
+end
+
+function MyBibliotheca:onCloseDocument()
+    self:autoPush()
+end
+
+function MyBibliotheca:autoPush()
+    if not self.config.auto_push or not self.ui.document or self.syncing
+        or not self.config.username or not self.config.userkey then return end
+    local state = self.ui.doc_settings
+    if not state:readSetting("mybibliotheca_pending")
+        and state:readSetting("mybibliotheca_synced") then return end
+    -- Check the existing link only. Never invoke a Wi-Fi prompt or enable the radio.
+    if not NetworkMgr:isConnected() then return end
+    -- Event-driven retries only; avoid repeated failures in a short reading session.
+    if self.last_auto_attempt and os.time() - self.last_auto_attempt < 300 then return end
+    self:syncCurrentBook(true)
+end
+
+function MyBibliotheca:syncCurrentBook(automatic)
+    if not self.ui.document or self.syncing then return end
     if not self.config.username or not self.config.userkey then
-        UIManager:show(InfoMessage:new{ text = _("Configure your KOReader sync credentials first.") })
+        if not automatic then
+            UIManager:show(InfoMessage:new{ text = _("Configure your KOReader sync credentials first.") })
+        end
         return
     end
-    NetworkMgr:runWhenOnline(function()
-        self.ui.annotation:updatePageNumbers(true)
-        local clipping_groups = self.parser:parseCurrentDoc()
-        local booknotes
-        for _, candidate in pairs(clipping_groups or {}) do
-            booknotes = candidate
-            break
+    local document = self.ui.document
+    local function sync()
+        -- Manual Wi-Fi setup may finish after the original book has been closed.
+        if self.ui.document ~= document or self.syncing then return end
+        self.syncing = true
+        local ok, message, success = pcall(self.pushCurrentBook, self, automatic)
+        socketutil:reset_timeout()
+        self.syncing = false
+        if not ok then
+            self:markPending()
+            self.ui.doc_settings:flush()
+            message = _("Highlight sync failed. Changes remain pending; try again later.")
+            logger.warn("MyBibliotheca: highlight sync failed")
         end
-        if not booknotes then
-            UIManager:show(InfoMessage:new{ text = _("No highlights or notes in this book.") })
-            return
+        if automatic then
+            self.last_auto_attempt = not (ok and success) and os.time() or nil
+            if message then logger.dbg("MyBibliotheca:", message) end
+        elseif message then
+            UIManager:show(InfoMessage:new{ text = message })
         end
-        local annotations = {}
-        for _, chapter in ipairs(booknotes) do
-            for _, entry in ipairs(chapter) do
-                local text = entry.text or ""
-                local note = entry.note or ""
-                if text:match("%S") or note:match("%S") then
-                    local stable_key = table.concat({ tostring(entry.page or entry.location or ""), tostring(entry.time or ""), text }, "\n")
-                    table.insert(annotations, {
-                        id = md5(stable_key),
-                        text = text,
-                        note = note,
-                        location = tostring(entry.page or entry.location or ""),
-                        highlighted_at = entry.time and os.date("!%Y-%m-%dT%H:%M:%SZ", entry.time) or nil,
-                    })
-                end
+    end
+    if automatic then sync() else NetworkMgr:runWhenOnline(sync) end
+end
+
+function MyBibliotheca:pushCurrentBook(automatic)
+    -- Reuse KOReader's exporter normalization without copying its whole clipping tree.
+    self.parser = self.parser or require("clip"):new{ ui = self.ui, settings = {} }
+    self.ui.annotation:updatePageNumbers(true)
+    local document_id = self.ui.doc_settings:readSetting("partial_md5_checksum")
+        or util.partialMD5(self.ui.document.file)
+    if not document_id then
+        self:markPending()
+        return _("Could not identify this document for syncing.")
+    end
+    local title, author = self.parser:getTitleAuthor(self.ui.document.file, self.ui.doc_props)
+    title = title or self.ui.doc_props.display_title or "Untitled"
+    author = (author or ""):gsub("\n", ", ")
+    local items = self.ui.annotation.annotations or {}
+    local function convert(item)
+        if not self.parser:doesHighlightMatch(item) then return end
+        local text = self.parser:getText(item.text)
+        local note = self.parser:getText(item.note)
+        if not text:match("%S") and not note:match("%S") then return end
+        local page = item.pageref or item.pageno or ""
+        local time = self.parser:getTime(item.datetime)
+        local stable_key = table.concat({ tostring(page), tostring(time or ""), text }, "\n")
+        return {
+            id = md5(stable_key),
+            text = text,
+            note = note,
+            location = tostring(page),
+            highlighted_at = time and os.date("!%Y-%m-%dT%H:%M:%SZ", time) or nil,
+        }
+    end
+    -- One fixed-size digest per book, including the destination and notes/edits.
+    local digest = md5(table.concat({ self.config.endpoint_url, self.config.username,
+        self.config.userkey, document_id, title, author }, "\n"))
+    local total = 0
+    for _, item in ipairs(items) do
+        local entry = convert(item)
+        if entry then
+            digest = md5(digest .. entry.id .. md5(entry.note) .. (entry.highlighted_at or ""))
+            total = total + 1
+        end
+    end
+    if total == 0 or automatic and self.ui.doc_settings:readSetting("mybibliotheca_synced") == digest then
+        self.ui.doc_settings:saveSetting("mybibliotheca_pending", false)
+        self.ui.doc_settings:saveSetting("mybibliotheca_synced", digest)
+        self.ui.doc_settings:flush()
+        if not automatic then return _("No highlights or notes in this book."), true end
+        return nil, true
+    end
+    self:markPending()
+    local uploaded = 0
+    local batch = {}
+    local function sendBatch()
+        local encoded, encode_error = rapidjson.encode({
+            document_id = document_id, title = title, author = author, annotations = batch,
+        })
+        if not encoded then return encode_error or "JSON encoding failed" end
+        if automatic then socketutil:set_timeout(3, 5) else socketutil:set_timeout(10, 30) end
+        local code, _, status = socket.skip(1, http.request{
+            url = self.config.endpoint_url,
+            method = "POST",
+            headers = {
+                ["Content-Type"] = "application/json",
+                ["Content-Length"] = tostring(#encoded),
+                ["X-Auth-User"] = self.config.username,
+                ["X-Auth-Key"] = self.config.userkey,
+            },
+            source = ltn12.source.string(encoded),
+            sink = ltn12.sink.null(),
+        })
+        socketutil:reset_timeout()
+        if code ~= 200 and code ~= 201 then
+            if code == 401 then
+                return _("Unauthorized. Check the sync username and password in Configure connection.")
+            end
+            return tostring(status or code or "network error")
+        end
+        uploaded = uploaded + #batch
+        batch = {}
+    end
+    local failure
+    for _, item in ipairs(items) do
+        local entry = convert(item)
+        if entry then
+            batch[#batch + 1] = entry
+            if #batch == 10 then
+                failure = sendBatch()
+                if failure then break end
             end
         end
-        if #annotations == 0 then
-            UIManager:show(InfoMessage:new{ text = _("No highlights or notes in this book.") })
-            return
-        end
-        local document_id = self.ui.doc_settings:readSetting("partial_md5_checksum") or util.partialMD5(self.ui.document.file)
-        if not document_id then
-            UIManager:show(InfoMessage:new{ text = _("Could not identify this document for syncing.") })
-            return
-        end
-        local author = (booknotes.author or ""):gsub("\n", ", ")
-        local uploaded = 0
-        local failure
-        for offset = 1, #annotations, 10 do
-            local batch = {}
-            for index = offset, math.min(offset + 9, #annotations) do
-                table.insert(batch, annotations[index])
-            end
-            local encoded, encode_error = rapidjson.encode({
-                document_id = document_id,
-                title = booknotes.title or self.ui.doc_props.display_title or "Untitled",
-                author = author,
-                annotations = batch,
-            })
-            if not encoded then
-                failure = encode_error or "JSON encoding failed"
-                break
-            end
-            local response = {}
-            socketutil:set_timeout(10, 30)
-            local code, _, status = socket.skip(1, http.request{
-                url = self.config.endpoint_url,
-                method = "POST",
-                headers = {
-                    ["Content-Type"] = "application/json",
-                    ["Content-Length"] = tostring(#encoded),
-                    ["X-Auth-User"] = self.config.username,
-                    ["X-Auth-Key"] = self.config.userkey,
-                },
-                source = ltn12.source.string(encoded),
-                sink = ltn12.sink.table(response),
-            })
-            socketutil:reset_timeout()
-            if code ~= 200 and code ~= 201 then
-                if code == 401 then
-                    failure = _("Unauthorized. Check the sync username and password in Configure connection.")
-                else
-                    failure = status or code or "network error"
-                end
-                break
-            end
-            uploaded = uploaded + #batch
-        end
-        if failure then
-            UIManager:show(InfoMessage:new{
-                text = string.format(_("Synced %d of %d items. Sync stopped: %s"), uploaded, #annotations, failure),
-            })
-        else
-            UIManager:show(InfoMessage:new{ text = string.format(_("Synced %d highlights and notes."), uploaded) })
-        end
-    end)
+    end
+    if not failure and #batch > 0 then failure = sendBatch() end
+    if failure then
+        self.ui.doc_settings:flush()
+        return string.format(_("Synced %d of %d items. Sync stopped: %s"), uploaded, total, failure)
+    end
+    self.ui.doc_settings:saveSetting("mybibliotheca_synced", digest)
+    self.ui.doc_settings:saveSetting("mybibliotheca_pending", false)
+    self.ui.doc_settings:flush()
+    return string.format(_("Synced %d highlights and notes."), uploaded), true
 end
 
 function MyBibliotheca:saveSettings()
